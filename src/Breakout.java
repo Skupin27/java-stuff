@@ -9,7 +9,7 @@ import java.util.prefs.Preferences;
  * Breakout / Brick Breaker.
  * Mouse or Left/Right (A/D) to move, Click or SPACE to launch, P to pause.
  */
-public class Breakout extends JPanel {
+public class Breakout extends JPanel implements Main.Game {
 
     // ---------- constants ----------
     static final int W = 640, H = 560, TOP = 50;
@@ -94,6 +94,11 @@ public class Breakout extends JPanel {
     private boolean newRecord;
     private double phase;
 
+    private final Timer loop = new Timer(16, e -> {
+        update();
+        repaint();
+    });
+
     public Breakout() {
         setPreferredSize(new Dimension(W, H));
         setBackground(new Color(14, 16, 28));
@@ -146,10 +151,13 @@ public class Breakout extends JPanel {
         addMouseMotionListener(mouse);
 
         toMenu();
-        new Timer(16, e -> {
-            update();
-            repaint();
-        }).start();
+        loop.start();
+    }
+
+    /** Called by the Main menu when this game is closed. */
+    @Override
+    public void stop() {
+        loop.stop();
     }
 
     private void moveMouse(int mx) {

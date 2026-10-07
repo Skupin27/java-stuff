@@ -1,344 +1,203 @@
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Deque;
 import java.util.Random;
-import java.util.prefs.Preferences;
+import java.util.function.Supplier;
 
+/**
+ * Game launcher / arcade menu.
+ *
+ * To add a new game:
+ *   1. Make a JPanel class that implements Main.Game (it needs a stop() method
+ *      that stops its timers).
+ *   2. Add one Entry to the GAMES array below.
+ */
 public class Main extends JPanel {
 
-    // ---------- constants ----------
-    static final int CELL = 25, COLS = 24, ROWS = 24, HUD = 40;
-    static final int W = COLS * CELL, H = ROWS * CELL;
-    static final int FOOD_PER_LEVEL = 5;
+    /** Implemented by every game panel so the menu can shut it down. */
+    public interface Game {
+        void stop();
+    }
 
-    enum State { MENU, PLAYING, PAUSED, OVER }
+    interface IconPainter {
+        void paint(Graphics2D g2, int x, int y, int size);
+    }
 
-    enum Difficulty {
-        //       label     delay  startRocks  rocksPerLevel
-        EASY("Easy", 140, 0, 0),
-        NORMAL("Normal", 105, 3, 1),
-        HARD("Hard", 75, 6, 2);
+    static class Entry {
+        final String name, blurb, controls;
+        final Color accent;
+        final Supplier<JPanel> factory;
+        final IconPainter icon;
 
-        final String label;
-        final int baseDelay, startRocks, rocksPerLevel;
-
-        Difficulty(String label, int baseDelay, int startRocks, int rocksPerLevel) {
-            this.label = label;
-            this.baseDelay = baseDelay;
-            this.startRocks = startRocks;
-            this.rocksPerLevel = rocksPerLevel;
+        Entry(String name, String blurb, String controls, Color accent,
+              Supplier<JPanel> factory, IconPainter icon) {
+            this.name = name;
+            this.blurb = blurb;
+            this.controls = controls;
+            this.accent = accent;
+            this.factory = factory;
+            this.icon = icon;
         }
     }
 
-    enum Kind { FOOD, BONUS, SLOW }
+    // ---------- register games here ----------
+    static final Entry[] GAMES = {
+            new Entry("Snek",
+                    "Classic snake with difficulty levels,\nrocks, golden fruit and slow-mo orbs.",
+                    "Arrows / WASD   -   P to pause",
+                    new Color(120, 230, 120),
+                    Snek::new, Main::snekIcon),
+            new Entry("Breakout",
+                    "Smash every brick with power-ups, combos\nand indestructible steel blocks.",
+                    "Mouse or Left/Right   -   SPACE to launch",
+                    new Color(255, 152, 67),
+                    Breakout::new, Main::breakoutIcon)
+    };
 
-    static class Item {
-        final Point p;
-        final Kind kind;
-        int life;
-        final int maxLife;
+    // ---------- window handling ----------
+    private static JFrame frame;
+    private static Main menu;
+    private static JMenuBar menuBar;
+    private static JPanel current;
 
-        Item(Point p, Kind kind, int life) {
-            this.p = p;
-            this.kind = kind;
-            this.life = life;
-            this.maxLife = life;
-        }
+    private static void showMenu() {
+        stopCurrent();
+        frame.setJMenuBar(null);
+        swapContent(menu);
     }
 
-    static class Particle {
-        double x, y, vx, vy;
-        int life;
-        final int maxLife;
-        final Color color;
-
-        Particle(double x, double y, double vx, double vy, int life, Color color) {
-            this.x = x;
-            this.y = y;
-            this.vx = vx;
-            this.vy = vy;
-            this.life = life;
-            this.maxLife = life;
-            this.color = color;
-        }
+    private static void launch(Entry e) {
+        stopCurrent();
+        JPanel game = e.factory.get();
+        current = game;
+        frame.setJMenuBar(menuBar);
+        frame.setTitle(e.name);
+        swapContent(game);
     }
 
-    // ---------- state ----------
-    private final Random random = new Random();
-    private final Preferences prefs = Preferences.userNodeForPackage(Main.class);
+    private static void swapContent(JPanel panel) {
+        frame.setContentPane(panel);
+        frame.pack();
+        frame.setLocationRelativeTo(null);
+        frame.revalidate();
+        frame.repaint();
+        if (panel == menu) frame.setTitle("Game Arcade");
+        SwingUtilities.invokeLater(panel::requestFocusInWindow);
+    }
 
-    private final ArrayList<Point> snake = new ArrayList<>();
-    private final ArrayList<Point> rocks = new ArrayList<>();
-    private final ArrayList<Particle> particles = new ArrayList<>();
-    private final Deque<int[]> inputQueue = new ArrayDeque<>();
+    private static void stopCurrent() {
+        if (current instanceof Game g) g.stop();
+        current = null;
+    }
 
-    private Item food, bonus, slow;
-    private State state = State.MENU;
-    private Difficulty difficulty = Difficulty.NORMAL;
-    private boolean wrapMode = false;
+    private static void buildMenuBar() {
+        menuBar = new JMenuBar();
+        JMenu m = new JMenu("Arcade");
+        m.setMnemonic(KeyEvent.VK_A);
 
-    private int dx = 1, dy = 0;
-    private int score, eaten, level, slowTicks, shake;
-    private boolean newRecord;
+        JMenuItem back = new JMenuItem("Back to menu");
+        back.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_M, InputEvent.CTRL_DOWN_MASK));
+        back.addActionListener(e -> showMenu());
+
+        JMenuItem quit = new JMenuItem("Quit");
+        quit.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_Q, InputEvent.CTRL_DOWN_MASK));
+        quit.addActionListener(e -> System.exit(0));
+
+        m.add(back);
+        m.addSeparator();
+        m.add(quit);
+        menuBar.add(m);
+    }
+
+    // ---------- the menu panel ----------
+    static final int W = 640, H = 560;
+    static final int CARD_X = 60, CARD_Y = 170, CARD_W = 520, CARD_H = 104, CARD_GAP = 16;
+
+    private int selected = 0;
     private double phase;
+    private final Timer anim = new Timer(30, e -> {
+        phase += 0.03;
+        repaint();
+    });
 
-    private final Timer gameTimer = new Timer(100, e -> step());
-    private final Timer animTimer = new Timer(25, e -> animate());
+    private final double[] starX = new double[45], starY = new double[45],
+            starSpeed = new double[45], starSize = new double[45];
 
     public Main() {
-        setPreferredSize(new Dimension(W, H + HUD));
-        setBackground(new Color(22, 22, 32));
+        setPreferredSize(new Dimension(W, H));
+        setBackground(new Color(14, 16, 28));
         setFocusable(true);
+
+        Random rnd = new Random();
+        for (int i = 0; i < starX.length; i++) {
+            starX[i] = rnd.nextDouble() * W;
+            starY[i] = rnd.nextDouble() * H;
+            starSpeed[i] = 6 + rnd.nextDouble() * 22;
+            starSize[i] = 1 + rnd.nextDouble() * 2.2;
+        }
+
         addKeyListener(new KeyAdapter() {
             @Override
             public void keyPressed(KeyEvent e) {
-                handleKey(e.getKeyCode());
+                int key = e.getKeyCode();
+                int n = GAMES.length;
+                if (key == KeyEvent.VK_UP || key == KeyEvent.VK_W) {
+                    selected = (selected + n - 1) % n;
+                } else if (key == KeyEvent.VK_DOWN || key == KeyEvent.VK_S) {
+                    selected = (selected + 1) % n;
+                } else if (key == KeyEvent.VK_ENTER || key == KeyEvent.VK_SPACE) {
+                    launch(GAMES[selected]);
+                } else if (key == KeyEvent.VK_ESCAPE) {
+                    System.exit(0);
+                } else if (key >= KeyEvent.VK_1 && key <= KeyEvent.VK_9) {
+                    int idx = key - KeyEvent.VK_1;
+                    if (idx < n) launch(GAMES[idx]);
+                }
             }
         });
-        animTimer.start();
-    }
 
-    // ---------- input ----------
-    private void handleKey(int key) {
-        switch (state) {
-            case MENU -> {
-                switch (key) {
-                    case KeyEvent.VK_UP, KeyEvent.VK_W ->
-                            difficulty = Difficulty.values()[(difficulty.ordinal() + 2) % 3];
-                    case KeyEvent.VK_DOWN, KeyEvent.VK_S ->
-                            difficulty = Difficulty.values()[(difficulty.ordinal() + 1) % 3];
-                    case KeyEvent.VK_LEFT, KeyEvent.VK_RIGHT, KeyEvent.VK_A, KeyEvent.VK_D, KeyEvent.VK_M ->
-                            wrapMode = !wrapMode;
-                    case KeyEvent.VK_ENTER, KeyEvent.VK_SPACE -> startGame();
-                }
+        MouseAdapter mouse = new MouseAdapter() {
+            @Override
+            public void mouseMoved(MouseEvent e) {
+                int i = cardAt(e.getPoint());
+                if (i >= 0) selected = i;
+                setCursor(Cursor.getPredefinedCursor(i >= 0 ? Cursor.HAND_CURSOR : Cursor.DEFAULT_CURSOR));
             }
-            case PLAYING -> {
-                switch (key) {
-                    case KeyEvent.VK_LEFT, KeyEvent.VK_A -> queueDir(-1, 0);
-                    case KeyEvent.VK_RIGHT, KeyEvent.VK_D -> queueDir(1, 0);
-                    case KeyEvent.VK_UP, KeyEvent.VK_W -> queueDir(0, -1);
-                    case KeyEvent.VK_DOWN, KeyEvent.VK_S -> queueDir(0, 1);
-                    case KeyEvent.VK_P, KeyEvent.VK_ESCAPE -> {
-                        state = State.PAUSED;
-                        gameTimer.stop();
-                    }
-                }
+
+            @Override
+            public void mousePressed(MouseEvent e) {
+                requestFocusInWindow();
+                int i = cardAt(e.getPoint());
+                if (i >= 0) launch(GAMES[i]);
             }
-            case PAUSED -> {
-                switch (key) {
-                    case KeyEvent.VK_P, KeyEvent.VK_ESCAPE, KeyEvent.VK_SPACE, KeyEvent.VK_ENTER -> {
-                        state = State.PLAYING;
-                        gameTimer.start();
-                    }
-                    case KeyEvent.VK_Q -> state = State.MENU;
-                }
-            }
-            case OVER -> {
-                switch (key) {
-                    case KeyEvent.VK_SPACE, KeyEvent.VK_ENTER -> startGame();
-                    case KeyEvent.VK_ESCAPE, KeyEvent.VK_Q -> state = State.MENU;
-                }
-            }
-        }
+        };
+        addMouseListener(mouse);
+        addMouseMotionListener(mouse);
     }
 
-    private void queueDir(int ndx, int ndy) {
-        int[] last = inputQueue.isEmpty() ? new int[]{dx, dy} : inputQueue.peekLast();
-        boolean opposite = last[0] == -ndx && last[1] == -ndy;
-        boolean same = last[0] == ndx && last[1] == ndy;
-        if (!opposite && !same && inputQueue.size() < 3) {
-            inputQueue.addLast(new int[]{ndx, ndy});
-        }
+    // run the background animation only while the menu is on screen
+    @Override
+    public void addNotify() {
+        super.addNotify();
+        anim.start();
     }
 
-    // ---------- game setup ----------
-    private void startGame() {
-        snake.clear();
-        rocks.clear();
-        particles.clear();
-        inputQueue.clear();
-        bonus = null;
-        slow = null;
-        food = null;
-
-        int cx = COLS / 2, cy = ROWS / 2;
-        for (int i = 0; i < 3; i++) snake.add(new Point(cx - i, cy));
-        dx = 1;
-        dy = 0;
-        score = 0;
-        eaten = 0;
-        level = 1;
-        slowTicks = 0;
-        shake = 0;
-        newRecord = false;
-
-        for (int i = 0; i < difficulty.startRocks; i++) addRock();
-        food = new Item(freeCell(0), Kind.FOOD, 0);
-
-        state = State.PLAYING;
-        gameTimer.setDelay(currentDelay());
-        gameTimer.start();
+    @Override
+    public void removeNotify() {
+        anim.stop();
+        super.removeNotify();
     }
 
-    private int currentDelay() {
-        int d = Math.max(45, difficulty.baseDelay - (level - 1) * 6);
-        return slowTicks > 0 ? (int) (d * 1.7) : d;
+    private Rectangle cardRect(int i) {
+        return new Rectangle(CARD_X, CARD_Y + i * (CARD_H + CARD_GAP), CARD_W, CARD_H);
     }
 
-    private boolean isOccupied(Point p) {
-        if (snake.contains(p) || rocks.contains(p)) return true;
-        if (food != null && food.p.equals(p)) return true;
-        if (bonus != null && bonus.p.equals(p)) return true;
-        return slow != null && slow.p.equals(p);
+    private int cardAt(Point p) {
+        for (int i = 0; i < GAMES.length; i++) if (cardRect(i).contains(p)) return i;
+        return -1;
     }
 
-    /** Random free cell that is at least minDist (Manhattan) away from the snake head. */
-    private Point freeCell(int minDist) {
-        Point head = snake.get(0);
-        for (int tries = 0; tries < 1000; tries++) {
-            Point p = new Point(random.nextInt(COLS), random.nextInt(ROWS));
-            int dist = Math.abs(p.x - head.x) + Math.abs(p.y - head.y);
-            if (!isOccupied(p) && dist >= minDist) return p;
-        }
-        return new Point(0, 0);
-    }
-
-    private void addRock() {
-        if (rocks.size() < 40) rocks.add(freeCell(6));
-    }
-
-    // ---------- game logic ----------
-    private void step() {
-        if (state != State.PLAYING) return;
-
-        if (!inputQueue.isEmpty()) {
-            int[] d = inputQueue.pollFirst();
-            dx = d[0];
-            dy = d[1];
-        }
-
-        Point head = snake.get(0);
-        int nx = head.x + dx, ny = head.y + dy;
-
-        if (wrapMode) {
-            nx = (nx + COLS) % COLS;
-            ny = (ny + ROWS) % ROWS;
-        } else if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) {
-            die();
-            return;
-        }
-        Point nh = new Point(nx, ny);
-
-        boolean eatFood = food != null && food.p.equals(nh);
-        boolean eatBonus = bonus != null && bonus.p.equals(nh);
-        boolean eatSlow = slow != null && slow.p.equals(nh);
-        boolean grow = eatFood || eatBonus;
-
-        // self collision (tail moves away unless we are growing)
-        int bodyLen = grow ? snake.size() : snake.size() - 1;
-        for (int i = 0; i < bodyLen; i++) {
-            if (snake.get(i).equals(nh)) {
-                die();
-                return;
-            }
-        }
-        if (rocks.contains(nh)) {
-            die();
-            return;
-        }
-
-        snake.add(0, nh);
-        if (!grow) snake.remove(snake.size() - 1);
-
-        if (eatFood) {
-            score += 10;
-            onEat(nh, new Color(235, 70, 80), 12);
-            food = new Item(freeCell(0), Kind.FOOD, 0);
-        }
-        if (eatBonus) {
-            score += 50;
-            onEat(nh, new Color(255, 205, 60), 30);
-            bonus = null;
-        }
-        if (eatSlow) {
-            slowTicks = 60;
-            burst(nh, new Color(90, 170, 255), 20);
-            slow = null;
-        }
-
-        // timed items and effects
-        if (bonus != null && --bonus.life <= 0) bonus = null;
-        if (slow != null && --slow.life <= 0) slow = null;
-        if (slowTicks > 0) slowTicks--;
-
-        // random spawns
-        if (bonus == null && random.nextDouble() < 0.012) {
-            bonus = new Item(freeCell(0), Kind.BONUS, 55);
-        }
-        if (slow == null && random.nextDouble() < 0.006) {
-            slow = new Item(freeCell(0), Kind.SLOW, 70);
-        }
-
-        gameTimer.setDelay(currentDelay());
-    }
-
-    private void onEat(Point cell, Color color, int count) {
-        burst(cell, color, count);
-        eaten++;
-        int newLevel = 1 + eaten / FOOD_PER_LEVEL;
-        if (newLevel > level) {
-            level = newLevel;
-            for (int i = 0; i < difficulty.rocksPerLevel; i++) addRock();
-        }
-    }
-
-    private String bestKey() {
-        return "best_" + difficulty.name() + (wrapMode ? "_wrap" : "_walls");
-    }
-
-    private int best() {
-        return prefs.getInt(bestKey(), 0);
-    }
-
-    private void die() {
-        state = State.OVER;
-        gameTimer.stop();
-        shake = 14;
-        burst(snake.get(0), new Color(255, 120, 120), 40);
-        if (score > best()) {
-            newRecord = score > 0;
-            prefs.putInt(bestKey(), score);
-        }
-    }
-
-    // ---------- effects ----------
-    private void burst(Point cell, Color color, int count) {
-        double cx = cell.x * CELL + CELL / 2.0, cy = cell.y * CELL + CELL / 2.0;
-        for (int i = 0; i < count; i++) {
-            double ang = random.nextDouble() * Math.PI * 2;
-            double speed = 1 + random.nextDouble() * 3.5;
-            particles.add(new Particle(cx, cy, Math.cos(ang) * speed, Math.sin(ang) * speed,
-                    18 + random.nextInt(14), color));
-        }
-    }
-
-    private void animate() {
-        phase += 0.12;
-        particles.removeIf(p -> {
-            p.x += p.vx;
-            p.y += p.vy;
-            p.vx *= 0.94;
-            p.vy *= 0.94;
-            return --p.life <= 0;
-        });
-        if (shake > 0) shake--;
-        repaint();
-    }
-
-    // ---------- rendering ----------
+    // ---------- painting ----------
     @Override
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);
@@ -346,206 +205,131 @@ public class Main extends JPanel {
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
 
-        drawHud(g2);
+        g2.setPaint(new GradientPaint(0, 0, new Color(20, 22, 44), 0, H, new Color(8, 8, 16)));
+        g2.fillRect(0, 0, W, H);
 
-        int sx = shake > 0 ? random.nextInt(shake + 1) - shake / 2 : 0;
-        int sy = shake > 0 ? random.nextInt(shake + 1) - shake / 2 : 0;
-        g2.translate(sx, HUD + sy);
-
-        drawBoard(g2);
-        if (state != State.MENU) {
-            drawRocks(g2);
-            drawItems(g2);
-            drawSnake(g2);
-            drawParticles(g2);
+        // drifting dots
+        for (int i = 0; i < starX.length; i++) {
+            double x = (starX[i] + phase * starSpeed[i] * 4) % W;
+            g2.setColor(new Color(255, 255, 255, 40 + (int) (starSize[i] * 20)));
+            g2.fill(new java.awt.geom.Ellipse2D.Double(x, starY[i], starSize[i], starSize[i]));
         }
 
-        g2.setColor(wrapMode ? new Color(90, 160, 255) : new Color(200, 200, 220));
-        g2.setStroke(new BasicStroke(wrapMode ? 2f : 3f,
-                BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10f,
-                wrapMode ? new float[]{8f, 6f} : null, 0f));
-        g2.drawRect(0, 0, W - 1, H - 1);
+        // title
+        Font titleFont = new Font("SansSerif", Font.BOLD, 56);
+        g2.setFont(titleFont);
+        String title = "GAME ARCADE";
+        int tw = g2.getFontMetrics().stringWidth(title);
+        int tx = (W - tw) / 2, ty = 98 + (int) (Math.sin(phase * 2) * 3);
+        g2.setColor(new Color(0, 0, 0, 150));
+        g2.drawString(title, tx + 3, ty + 3);
+        g2.setPaint(new GradientPaint(tx, 0, new Color(120, 230, 120), tx + tw, 0, new Color(255, 152, 67)));
+        g2.drawString(title, tx, ty);
+
+        centered(g2, "Choose a game", new Font("SansSerif", Font.PLAIN, 17), new Color(170, 175, 205), 138);
+
+        // cards
+        for (int i = 0; i < GAMES.length; i++) drawCard(g2, i);
+
+        // footer
+        Font small = new Font("SansSerif", Font.PLAIN, 13);
+        Color grey = new Color(130, 135, 165);
+        centered(g2, "Up / Down + Enter, click a card, or press 1-" + GAMES.length + "      Esc: quit", small, grey, H - 42);
+        centered(g2, "Inside a game: Ctrl+M returns to this menu", small, grey, H - 22);
+    }
+
+    private void drawCard(Graphics2D g2, int i) {
+        Entry e = GAMES[i];
+        Rectangle r = cardRect(i);
+        boolean sel = i == selected;
+        int lift = sel ? -2 : 0;
+
+        if (sel) {
+            g2.setColor(new Color(e.accent.getRed(), e.accent.getGreen(), e.accent.getBlue(),
+                    40 + (int) (20 * Math.sin(phase * 4))));
+            g2.fillRoundRect(r.x - 6, r.y - 6 + lift, r.width + 12, r.height + 12, 26, 26);
+        }
+        g2.setColor(sel ? new Color(44, 50, 84) : new Color(32, 36, 60));
+        g2.fillRoundRect(r.x, r.y + lift, r.width, r.height, 20, 20);
+        g2.setColor(sel ? e.accent : new Color(60, 66, 100));
+        g2.setStroke(new BasicStroke(sel ? 2.5f : 1.5f));
+        g2.drawRoundRect(r.x, r.y + lift, r.width, r.height, 20, 20);
         g2.setStroke(new BasicStroke(1f));
 
-        switch (state) {
-            case MENU -> drawMenu(g2);
-            case PAUSED -> drawOverlay(g2, "PAUSED", "SPACE / P to resume  -  Q for menu", null);
-            case OVER -> drawOverlay(g2, "GAME OVER",
-                    "Score: " + score + (newRecord ? "   NEW RECORD!" : "   Best: " + best()),
-                    "SPACE to retry  -  Q for menu");
-            default -> { }
-        }
-        g2.translate(-sx, -(HUD + sy));
-    }
+        // icon
+        e.icon.paint(g2, r.x + 18, r.y + 12 + lift, 80);
 
-    private void drawHud(Graphics2D g2) {
-        g2.setColor(new Color(15, 15, 22));
-        g2.fillRect(0, 0, W, HUD);
-        g2.setFont(new Font("SansSerif", Font.BOLD, 16));
+        // text
+        int tx = r.x + 118;
+        g2.setFont(new Font("SansSerif", Font.BOLD, 26));
         g2.setColor(Color.WHITE);
-        g2.drawString("Score: " + score, 12, 26);
-        g2.drawString("Level: " + level, 140, 26);
-        g2.setColor(new Color(255, 205, 60));
-        g2.drawString("Best: " + best(), 250, 26);
-        g2.setColor(new Color(170, 170, 190));
+        g2.drawString(e.name, tx, r.y + 34 + lift);
+
         g2.setFont(new Font("SansSerif", Font.PLAIN, 13));
-        g2.drawString(difficulty.label + " / " + (wrapMode ? "Wrap" : "Walls"), 360, 26);
+        g2.setColor(new Color(190, 195, 220));
+        String[] lines = e.blurb.split("\n");
+        for (int k = 0; k < lines.length; k++) {
+            g2.drawString(lines[k], tx, r.y + 56 + k * 16 + lift);
+        }
+        g2.setFont(new Font("SansSerif", Font.PLAIN, 12));
+        g2.setColor(sel ? e.accent : new Color(130, 135, 165));
+        g2.drawString(e.controls, tx, r.y + 94 + lift);
 
-        if (slowTicks > 0) {
-            g2.setColor(new Color(90, 170, 255));
-            g2.setFont(new Font("SansSerif", Font.BOLD, 13));
-            g2.drawString("SLOW " + (slowTicks * currentDelay() / 1000 + 1) + "s", W - 80, 26);
+        // number badge + play arrow
+        g2.setFont(new Font("SansSerif", Font.BOLD, 12));
+        g2.setColor(new Color(130, 135, 165));
+        g2.drawString("[" + (i + 1) + "]", r.x + r.width - 34, r.y + 22 + lift);
+        if (sel) {
+            int ax = r.x + r.width - 40, ay = r.y + r.height / 2 + lift + 6;
+            int nudge = (int) (Math.sin(phase * 5) * 3);
+            g2.setColor(e.accent);
+            g2.fillPolygon(new int[]{ax + nudge, ax + 18 + nudge, ax + nudge},
+                    new int[]{ay - 12, ay, ay + 12}, 3);
         }
     }
 
-    private void drawBoard(Graphics2D g2) {
-        for (int x = 0; x < COLS; x++) {
-            for (int y = 0; y < ROWS; y++) {
-                g2.setColor((x + y) % 2 == 0 ? new Color(30, 30, 44) : new Color(26, 26, 38));
-                g2.fillRect(x * CELL, y * CELL, CELL, CELL);
-            }
-        }
-    }
-
-    private void drawRocks(Graphics2D g2) {
-        for (Point r : rocks) {
-            g2.setColor(new Color(110, 110, 125));
-            g2.fillRoundRect(r.x * CELL + 1, r.y * CELL + 1, CELL - 2, CELL - 2, 6, 6);
-            g2.setColor(new Color(75, 75, 90));
-            g2.drawRoundRect(r.x * CELL + 1, r.y * CELL + 1, CELL - 3, CELL - 3, 6, 6);
-            g2.setColor(new Color(140, 140, 155));
-            g2.fillRect(r.x * CELL + 5, r.y * CELL + 5, 6, 3);
-        }
-    }
-
-    private void drawItems(Graphics2D g2) {
-        double pulse = Math.sin(phase * 2) * 2;
-
-        if (food != null) {
-            int px = food.p.x * CELL, py = food.p.y * CELL;
-            int s = (int) (CELL - 8 + pulse);
-            int o = (CELL - s) / 2;
-            g2.setColor(new Color(235, 70, 80));
-            g2.fillOval(px + o, py + o, s, s);
-            g2.setColor(new Color(255, 160, 160));
-            g2.fillOval(px + o + 3, py + o + 3, 5, 5);
-        }
-
-        if (bonus != null) {
-            int px = bonus.p.x * CELL, py = bonus.p.y * CELL;
-            boolean blink = bonus.life > 15 || (bonus.life / 2) % 2 == 0;
-            if (blink) {
-                g2.setColor(new Color(255, 205, 60));
-                g2.fillOval(px + 3, py + 3, CELL - 6, CELL - 6);
-                g2.setColor(new Color(255, 245, 170));
-                g2.fillOval(px + 8, py + 6, 6, 6);
-                g2.setColor(new Color(255, 255, 255, 190));
-                g2.setStroke(new BasicStroke(2f));
-                g2.drawArc(px, py, CELL, CELL, 90, (int) (360.0 * bonus.life / bonus.maxLife));
-                g2.setStroke(new BasicStroke(1f));
-            }
-        }
-
-        if (slow != null) {
-            int px = slow.p.x * CELL, py = slow.p.y * CELL;
-            boolean blink = slow.life > 15 || (slow.life / 2) % 2 == 0;
-            if (blink) {
-                int c = CELL / 2;
-                int r = (int) (9 + pulse / 2);
-                Polygon d = new Polygon(
-                        new int[]{px + c, px + c + r, px + c, px + c - r},
-                        new int[]{py + c - r, py + c, py + c + r, py + c}, 4);
-                g2.setColor(new Color(90, 170, 255));
-                g2.fillPolygon(d);
-                g2.setColor(Color.WHITE);
-                g2.drawPolygon(d);
-            }
-        }
-    }
-
-    private void drawSnake(Graphics2D g2) {
-        int n = snake.size();
-        for (int i = n - 1; i >= 0; i--) {
-            Point p = snake.get(i);
-            float t = n > 1 ? (float) i / (n - 1) : 0f;
-            Color c = state == State.OVER
-                    ? new Color(150, 90, 90)
-                    : blend(new Color(130, 240, 130), new Color(30, 130, 80), t);
-            if (slowTicks > 0 && state != State.OVER) c = blend(c, new Color(90, 170, 255), 0.45f);
-            g2.setColor(c);
-            g2.fillRoundRect(p.x * CELL + 1, p.y * CELL + 1, CELL - 2, CELL - 2, 9, 9);
-        }
-
-        // eyes
-        Point h = snake.get(0);
-        int cx = h.x * CELL + CELL / 2, cy = h.y * CELL + CELL / 2;
-        int fx = dx * 5, fy = dy * 5;       // forward offset
-        int sx = -dy * 5, sy = dx * 5;      // sideways offset
-        g2.setColor(Color.WHITE);
-        g2.fillOval(cx + fx + sx - 3, cy + fy + sy - 3, 6, 6);
-        g2.fillOval(cx + fx - sx - 3, cy + fy - sy - 3, 6, 6);
-        g2.setColor(Color.BLACK);
-        g2.fillOval(cx + fx + sx + dx - 1, cy + fy + sy + dy - 1, 3, 3);
-        g2.fillOval(cx + fx - sx + dx - 1, cy + fy - sy + dy - 1, 3, 3);
-    }
-
-    private void drawParticles(Graphics2D g2) {
-        for (Particle p : particles) {
-            int alpha = Math.max(0, Math.min(255, 255 * p.life / p.maxLife));
-            g2.setColor(new Color(p.color.getRed(), p.color.getGreen(), p.color.getBlue(), alpha));
-            g2.fillOval((int) p.x - 2, (int) p.y - 2, 5, 5);
-        }
-    }
-
-    private void drawMenu(Graphics2D g2) {
-        g2.setColor(new Color(0, 0, 0, 175));
-        g2.fillRect(0, 0, W, H);
-
-        drawCentered(g2, "SNAKE", new Font("SansSerif", Font.BOLD, 64), new Color(120, 230, 120), 130);
-        drawCentered(g2, "Select difficulty (Up / Down)", new Font("SansSerif", Font.PLAIN, 15),
-                new Color(170, 170, 190), 195);
-
-        Difficulty[] all = Difficulty.values();
-        for (int i = 0; i < all.length; i++) {
-            boolean sel = all[i] == difficulty;
-            drawCentered(g2, sel ? "<  " + all[i].label + "  >" : all[i].label,
-                    new Font("SansSerif", sel ? Font.BOLD : Font.PLAIN, sel ? 26 : 22),
-                    sel ? Color.WHITE : new Color(120, 120, 140), 240 + i * 38);
-        }
-
-        drawCentered(g2, "Mode (Left / Right):  " + (wrapMode ? "WRAP - walls loop around" : "WALLS - walls are deadly"),
-                new Font("SansSerif", Font.BOLD, 16), new Color(90, 170, 255), 395);
-        drawCentered(g2, "High score: " + best(), new Font("SansSerif", Font.PLAIN, 16),
-                new Color(255, 205, 60), 425);
-        drawCentered(g2, "Press SPACE to start", new Font("SansSerif", Font.BOLD, 20), Color.WHITE, 475);
-
-        Font small = new Font("SansSerif", Font.PLAIN, 13);
-        Color grey = new Color(160, 160, 180);
-        drawCentered(g2, "Move: Arrows / WASD     Pause: P", small, grey, 515);
-        drawCentered(g2, "Red = +10     Gold = +50 (timed)     Blue = slow-motion     Grey = rocks", small, grey, 538);
-    }
-
-    private void drawOverlay(Graphics2D g2, String title, String line1, String line2) {
-        g2.setColor(new Color(0, 0, 0, 165));
-        g2.fillRect(0, 0, W, H);
-        drawCentered(g2, title, new Font("SansSerif", Font.BOLD, 52), Color.WHITE, H / 2 - 20);
-        drawCentered(g2, line1, new Font("SansSerif", Font.BOLD, 18), new Color(255, 205, 60), H / 2 + 20);
-        if (line2 != null) {
-            drawCentered(g2, line2, new Font("SansSerif", Font.PLAIN, 15), new Color(170, 170, 190), H / 2 + 50);
-        }
-    }
-
-    private void drawCentered(Graphics2D g2, String text, Font font, Color color, int y) {
-        g2.setFont(font);
+    private void centered(Graphics2D g2, String text, Font f, Color c, int y) {
+        g2.setFont(f);
         int x = (W - g2.getFontMetrics().stringWidth(text)) / 2;
-        g2.setColor(new Color(0, 0, 0, 160));
-        g2.drawString(text, x + 2, y + 2);
-        g2.setColor(color);
+        g2.setColor(c);
         g2.drawString(text, x, y);
     }
 
+    // ---------- icons ----------
+    private static void snekIcon(Graphics2D g2, int x, int y, int s) {
+        g2.setColor(new Color(20, 22, 34));
+        g2.fillRoundRect(x, y, s, s, 14, 14);
+        int c = s / 5;
+        int[][] seg = {{0, 3}, {1, 3}, {2, 3}, {2, 2}, {2, 1}, {3, 1}}; // tail -> head
+        for (int i = 0; i < seg.length; i++) {
+            float t = (float) i / (seg.length - 1);
+            g2.setColor(blend(new Color(30, 130, 80), new Color(130, 240, 130), t));
+            g2.fillRoundRect(x + seg[i][0] * c + 1, y + seg[i][1] * c + 1, c - 2, c - 2, 6, 6);
+        }
+        g2.setColor(Color.WHITE);
+        g2.fillOval(x + 3 * c + c - 7, y + c + 3, 4, 4);
+        g2.fillOval(x + 3 * c + c - 7, y + c + c - 7, 4, 4);
+        g2.setColor(new Color(235, 70, 80));
+        g2.fillOval(x + 4 * c + 2, y + 1 * c + 2, c - 4, c - 4);
+    }
+
+    private static void breakoutIcon(Graphics2D g2, int x, int y, int s) {
+        g2.setColor(new Color(20, 22, 34));
+        g2.fillRoundRect(x, y, s, s, 14, 14);
+        Color[] cols = {new Color(239, 83, 80), new Color(255, 152, 67), new Color(255, 213, 79)};
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 4; c++) {
+                g2.setColor(cols[r]);
+                g2.fillRoundRect(x + 6 + c * 17, y + 8 + r * 10, 15, 8, 3, 3);
+            }
+        }
+        g2.setColor(Color.WHITE);
+        g2.fillOval(x + 44, y + 48, 8, 8);
+        g2.setColor(new Color(200, 210, 240));
+        g2.fillRoundRect(x + 22, y + 66, 36, 6, 6, 6);
+    }
+
     private static Color blend(Color a, Color b, float t) {
-        t = Math.max(0f, Math.min(1f, t));
         return new Color(
                 (int) (a.getRed() + (b.getRed() - a.getRed()) * t),
                 (int) (a.getGreen() + (b.getGreen() - a.getGreen()) * t),
@@ -555,12 +339,16 @@ public class Main extends JPanel {
     // ---------- entry point ----------
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
-            JFrame frame = new JFrame("Snake");
+            try {
+                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            } catch (Exception ignored) {
+            }
+            frame = new JFrame("Game Arcade");
             frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
             frame.setResizable(false);
-            frame.add(new Main());
-            frame.pack();
-            frame.setLocationRelativeTo(null);
+            menu = new Main();
+            buildMenuBar();
+            showMenu();
             frame.setVisible(true);
         });
     }
